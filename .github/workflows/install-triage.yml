@@ -1,0 +1,153 @@
+name: Install issue triage relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      repositories:
+        description: "Repository names separated by commas/spaces, or * for all eligible repositories"
+        required: true
+        type: string
+      central_ref:
+        description: "Branch, tag, or SHA of the central workflow"
+        required: true
+        default: "main"
+        type: string
+      dry_run:
+        description: "Only show which repositories would be changed"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Create relay pull requests
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ORG_WORKFLOW_TOKEN }}
+      CENTRAL_REPOSITORY: ${{ github.repository }}
+      CENTRAL_REF: ${{ inputs.central_ref }}
+      REPOSITORIES: ${{ inputs.repositories }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "ORG_WORKFLOW_TOKEN is not configured" >&2
+            exit 1
+          fi
+
+          if [[ ! "${CENTRAL_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "central_ref contains unsupported characters" >&2
+            exit 1
+          fi
+
+      - name: Install relay
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          organization="${CENTRAL_REPOSITORY%%/*}"
+          normalized_repositories="$(printf '%s' "${REPOSITORIES}" | tr ',[:space:]' '\n' | sed '/^$/d' | sort -u)"
+
+          if [[ -z "${normalized_repositories}" ]]; then
+            echo "No repositories were provided" >&2
+            exit 1
+          fi
+
+          if [[ "${normalized_repositories}" == "*" ]]; then
+            normalized_repositories="$(
+              gh api --paginate "orgs/${organization}/repos?per_page=100&type=all" \
+                --jq '.[] | select(.archived == false and .fork == false and .has_issues == true) | .name' \
+                | sort -u
+            )"
+          elif grep -qxF '*' <<< "${normalized_repositories}"; then
+            echo "Use * alone or provide explicit repository names" >&2
+            exit 1
+          fi
+
+          while IFS= read -r repository; do
+            if [[ ! "${repository}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid repository name: ${repository}" >&2
+              exit 1
+            fi
+
+            target="${organization}/${repository}"
+            echo "Preparing ${target}"
+
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              continue
+            fi
+
+            relay="$(cat <<EOF
+          name: Organization Issue Triage
+
+          on:
+            issues:
+              types: [opened, reopened]
+
+          permissions:
+            contents: read
+            issues: write
+            copilot-requests: write
+
+          jobs:
+            triage:
+              uses: ${CENTRAL_REPOSITORY}/.github/workflows/issue-triage.lock.yml@${CENTRAL_REF}
+          EOF
+          )"
+            path='.github/workflows/issue-triage.yml'
+            default_branch="$(gh api "repos/${target}" --jq '.default_branch')"
+            installed_relay="$(gh api "repos/${target}/contents/${path}?ref=${default_branch}" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
+
+            if [[ "${installed_relay}" == "${relay}" ]]; then
+              echo "Already installed in ${target}"
+              continue
+            fi
+
+            base_sha="$(gh api "repos/${target}/git/ref/heads/${default_branch}" --jq '.object.sha')"
+            branch="automation/install-issue-triage"
+            existing_pr="$(gh pr list --repo "${target}" --head "${branch}" --state open --json url --jq '.[0].url // empty')"
+
+            if ! gh api "repos/${target}/git/ref/heads/${branch}" >/dev/null 2>&1; then
+              gh api --method POST "repos/${target}/git/refs" \
+                -f ref="refs/heads/${branch}" \
+                -f sha="${base_sha}" >/dev/null
+            elif [[ -z "${existing_pr}" ]]; then
+              gh api --method PATCH "repos/${target}/git/refs/heads/${branch}" \
+                -f sha="${base_sha}" \
+                -F force=true >/dev/null
+            fi
+
+            encoded_relay="$(printf '%s\n' "${relay}" | base64 | tr -d '\n')"
+            existing_sha="$(gh api "repos/${target}/contents/${path}?ref=${branch}" --jq '.sha' 2>/dev/null || true)"
+
+            arguments=(
+              --method PUT
+              "repos/${target}/contents/${path}"
+              -f message='chore: install centralized issue triage'
+              -f content="${encoded_relay}"
+              -f branch="${branch}"
+            )
+            if [[ -n "${existing_sha}" ]]; then
+              arguments+=(-f sha="${existing_sha}")
+            fi
+            gh api "${arguments[@]}" >/dev/null
+
+            if [[ -n "${existing_pr}" ]]; then
+              echo "Updated ${existing_pr}"
+              continue
+            fi
+
+            gh pr create \
+              --repo "${target}" \
+              --base "${default_branch}" \
+              --head "${branch}" \
+              --title 'chore: install centralized issue triage' \
+                --body "Installs the issue relay backed by \`${CENTRAL_REPOSITORY}@${CENTRAL_REF}\`."
+          done <<< "${normalized_repositories}"

@@ -1,0 +1,14 @@
+name: Organization Issue Triage
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  copilot-requests: write
+
+jobs:
+  triage:
+    uses: ORGANIZATION/issue-triage/.github/workflows/issue-triage.lock.yml@main
